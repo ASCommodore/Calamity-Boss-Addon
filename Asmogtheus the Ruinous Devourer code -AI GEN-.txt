@@ -1,0 +1,428 @@
+using System;
+using System.IO;
+using System.Reflection;
+using Microsoft.Xna.Framework;
+using Terraria;
+using Terraria.ModLoader;
+using Terraria.ID;
+using Terraria.IO;
+using Terraria.GameContent.ItemDropRules;
+using Terraria.WorldBuilding;
+using AsmogtheustheRuinousDevourer.Systems;
+using AsmogtheustheRuinousDevourer.Players;
+using AsmogtheustheRuinousDevourer.NPCs;
+
+namespace AsmogtheustheRuinousDevourer.Systems
+{
+    // =========================================================================
+    // 1. GLOBAL WORLD TRACKER SYSTEM (AsmogtheusWorldSystem.cs)
+    // =========================================================================
+    public class AsmogtheusWorldSystem : ModSystem
+    {
+        public static bool HasAsmogtheusSpawned = false;
+        public static bool DownedAsmogtheus = false;
+
+        public override void ClearWorld()
+        {
+            HasAsmogtheusSpawned = false;
+            DownedAsmogtheus = false;
+        }
+
+        public override void SaveWorldData(TagCompound tag)
+        {
+            tag["HasAsmogtheusSpawned"] = HasAsmogtheusSpawned;
+            tag["DownedAsmogtheus"] = DownedAsmogtheus;
+        }
+
+        public override void LoadWorldData(TagCompound tag)
+        {
+            HasAsmogtheusSpawned = tag.GetBool("HasAsmogtheusSpawned");
+            DownedAsmogtheus = tag.GetBool("DownedAsmogtheus");
+        }
+
+        // Underworld Biome Override -> Forces Ice Biome properties if curse is active
+        public override void TileCountsAvailable(ReadOnlySpan<int> tileCounts)
+        {
+            if (HasAsmogtheusSpawned && !DownedAsmogtheus)
+            {
+                Player player = Main.LocalPlayer;
+                if (player.ZoneUnderworldHeight)
+                {
+                    player.ZoneSnow = true; 
+                }
+            }
+        }
+
+        // Space Hazard Tracker -> Spawns The Destroyer infinitely in space until boss is dead
+        public override void PostUpdateWorld()
+        {
+            if (HasAsmogtheusSpawned && !DownedAsmogtheus && Main.netMode != NetmodeID.MultiplayerClient)
+            {
+                for (int i = 0; i < Main.maxPlayers; i++)
+                {
+                    Player player = Main.player[i];
+                    if (player.active && !player.dead && player.ZoneSkyHeight)
+                    {
+                        if (!NPC.AnyNPCs(NPCID.TheDestroyer))
+                        {
+                            int spawnX = (int)player.position.X + Main.rand.Next(-400, 400);
+                            int spawnY = (int)player.position.Y + 600;
+                            
+                            NPC.NewNPC(NPC.GetSource_NaturalSpawn(), spawnX, spawnY, NPCID.TheDestroyer);
+                            Main.NewText("The cosmos rejects your intrusion! The mechanical threat awakens!", Color.Purple);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+namespace AsmogtheustheRuinousDevourer.Players
+{
+    // =========================================================================
+    // 2. GLOBAL PLAYER MECHANIC MODIFIER (AsmogtheusPlayer.cs)
+    // =========================================================================
+    public class AsmogtheusPlayer : ModPlayer
+    {
+        public static bool IsAsmogtheusEnraged = false;
+
+        public override void ResetEffects()
+        {
+            if (!NPC.AnyNPCs(ModContent.NPCType<AsmogtheusHead>()))
+            {
+                IsAsmogtheusEnraged = false;
+            }
+        }
+
+        public override void PostUpdate()
+        {
+            // Accelerated Adrenaline Logic (50% Faster in Revengeance/Death Mode)
+            if (IsAsmogtheusEnraged && ModLoader.TryGetMod("CalamityMod", out Mod calamity))
+            {
+                if (calamity.TryFind("CalamityWorld", out ModSystem calamityWorld))
+                {
+                    bool isRevengeance = false;
+                    bool isDeath = false;
+
+                    try
+                    {
+                        var diffField = calamityWorld.GetType().GetField("revengeance", BindingFlags.Public | BindingFlags.Static);
+                        var deathField = calamityWorld.GetType().GetField("death", BindingFlags.Public | BindingFlags.Static);
+                        
+                        if (diffField != null) isRevengeance = (bool)diffField.GetValue(null);
+                        if (deathField != null) isDeath = (bool)deathField.GetValue(null);
+                    }
+                    catch { }
+
+                    if (isRevengeance || isDeath)
+                    {
+                        if (Player.TryGetModPlayer(calamity, "CalamityPlayer", out ModPlayer calPlayer))
+                        {
+                            try
+                            {
+                                var adrenalineMeterField = calPlayer.GetType().GetField("adrenalineMeter", BindingFlags.Public | BindingFlags.Instance);
+                                var adrenalineMaxField = calPlayer.GetType().GetField("adrenalineMax", BindingFlags.Public | BindingFlags.Instance);
+
+                                if (adrenalineMeterField != null && adrenalineMaxField != null)
+                                {
+                                    float currentAdrenaline = (float)adrenalineMeterField.GetValue(calPlayer);
+                                    float maxAdrenaline = (float)adrenalineMaxField.GetValue(calPlayer);
+
+                                    if (currentAdrenaline < maxAdrenaline)
+                                    {
+                                        float normalGainRate = 1.0f; 
+                                        adrenalineMeterField.SetValue(calPlayer, currentAdrenaline + (normalGainRate * 0.5f));
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+namespace AsmogtheustheRuinousDevourer.NPCs
+{
+    // =========================================================================
+    // 3. WORM BOSS SEGMENTS & LOGIC (AsmogtheusBoss.cs)
+    // =========================================================================
+    [AutoloadBossHead]
+    public class AsmogtheusHead : ModNPC
+    {
+        private int spawnImmunityTimer = 600; // 10 seconds (60 ticks * 10)
+        private bool hasSpawnedNuisances = false;
+        private bool hasTriggeredEnrage = false;
+        private bool killedByExorcism = false;
+
+        public override void SetDefaults()
+        {
+            NPC.name = "Asmogtheus the Ruinous Devourer";
+            NPC.width = 110;
+            NPC.height = 110;
+            NPC.damage = 380;
+            NPC.defense = 250;
+            NPC.lifeMax = 2000000000; // Bound to engine maximum limits safely
+            NPC.boss = true;
+            NPC.lavaImmune = true;
+            NPC.noGravity = true;
+            NPC.noTileCollide = true;
+            NPC.behindTiles = true;
+            NPC.npcSlots = 10f;
+            
+            if (!Main.dedServ)
+                Music = MusicID.Boss5; 
+        }
+
+        public override void AI()
+        {
+            // Spawn Message Trigger
+            if (NPC.localAI == 0)
+            {
+                NPC.localAI = 1;
+                AsmogtheusWorldSystem.HasAsmogtheusSpawned = true;
+                
+                if (Main.netMode != NetmodeID.MultiplayerClient)
+                {
+                    Main.NewText("The Heavens tremble, The Underworld freezes over", Color.LightCyan);
+                }
+            }
+
+            // 10s Frame Immunity Guard
+            if (spawnImmunityTimer > 0)
+            {
+                spawnImmunityTimer--;
+                NPC.dontTakeDamage = true;
+                return; 
+            }
+            else
+            {
+                NPC.dontTakeDamage = false;
+            }
+
+            // 50% HP Fracturing / Vanish State -> Spawns 2 Nuisances
+            if (NPC.life <= NPC.lifeMax * 0.5f && !hasSpawnedNuisances)
+            {
+                hasSpawnedNuisances = true;
+
+                if (Main.netMode != NetmodeID.MultiplayerClient)
+                {
+                    Main.NewText("The Ruinous Servants have appeared", Color.OrangeRed);
+                    NPC.NewNPC(NPC.GetSource_FromAI(), (int)NPC.center.X - 300, (int)NPC.center.Y, ModContent.NPCType<DivineWormNuisance>());
+                    NPC.NewNPC(NPC.GetSource_FromAI(), (int)NPC.center.X + 300, (int)NPC.center.Y, ModContent.NPCType<DivineWormNuisance>());
+                }
+
+                NPC.position.Y += 5000; 
+                NPC.netUpdate = true;
+                return;
+            }
+
+            // 25% HP Enrage System Trigger
+            if (NPC.life <= NPC.lifeMax * 0.25f && !hasTriggeredEnrage)
+            {
+                hasTriggeredEnrage = true;
+                AsmogtheusPlayer.IsAsmogtheusEnraged = true;
+
+                Terraria.Audio.SoundEngine.PlaySound(SoundID.Roar, NPC.position); 
+                CombatText.NewText(NPC.getRect(), Color.Crimson, "ASMYGTHEUS ENRAGES!!!", true, true);
+
+                if (Main.netMode != NetmodeID.Server)
+                {
+                    Main.LocalPlayer.ScreenPosition += Main.rand.NextVector2Circular(20f, 20f);
+                }
+                NPC.netUpdate = true;
+            }
+
+            // Highest Defense Target Lock Aggro
+            int targetPlayerIndex = -1;
+            int highestDefense = -1;
+
+            for (int i = 0; i < Main.maxPlayers; i++)
+            {
+                Player p = Main.player[i];
+                if (p.active && !p.dead && Vector2.Distance(NPC.Center, p.Center) < 12000f)
+                {
+                    if (p.statDefense > highestDefense)
+                    {
+                        highestDefense = p.statDefense;
+                        targetPlayerIndex = i;
+                    }
+                }
+            }
+
+            if (targetPlayerIndex == -1)
+            {
+                NPC.TargetClosest(true);
+                targetPlayerIndex = NPC.target;
+            }
+            else
+            {
+                NPC.target = targetPlayerIndex;
+            }
+
+            Player targetPlayer = Main.player[targetPlayerIndex];
+
+            // Velocity Engine Locked at Exactly 40mph (14.7f vector velocity magnitude)
+            Vector2 targetDirection = targetPlayer.Center - NPC.Center;
+            float distanceToTarget = targetDirection.Length();
+
+            float speed = 14.7f;      
+            float turnSpeed = hasTriggeredEnrage ? 0.35f : 0.25f; // Sharper tracks when enraged
+
+            if (distanceToTarget > 0)
+            {
+                targetDirection.Normalize();
+                targetDirection *= speed;
+                NPC.velocity.X = NPC.velocity.X + (targetDirection.X - NPC.velocity.X) * turnSpeed;
+                NPC.velocity.Y = NPC.velocity.Y + (targetDirection.Y - NPC.velocity.Y) * turnSpeed;
+            }
+
+            if (NPC.velocity.Length() != speed && NPC.velocity.Length() > 0.1f)
+            {
+                NPC.velocity.Normalize();
+                NPC.velocity *= speed;
+            }
+
+            NPC.rotation = (float)Math.Atan2(NPC.velocity.Y, NPC.velocity.X) + 1.57f;
+            
+            if (Main.netMode != NetmodeID.SinglePlayer && Main.rand.NextBool(20))
+            {
+                NPC.netUpdate = true;
+            }
+        }
+
+        public override void ModifyHitByProjectile(Projectile projectile, ref NPC.HitModifiers modifiers)
+        {
+            if (CheckExorcismOneTap(projectile, ref modifiers)) return;
+            ApplyDynamicDamageScaling(ref modifiers);
+        }
+
+        public override void ModifyHitByItem(Player player, Item item, ref NPC.HitModifiers modifiers)
+        {
+            ApplyDynamicDamageScaling(ref modifiers);
+        }
+
+        // Lower HP = Takes More Damage Curve scaling
+        private void ApplyDynamicDamageScaling(ref NPC.HitModifiers modifiers)
+        {
+            float healthRatio = (float)NPC.life / NPC.lifeMax;
+            float damageMultiplier = MathHelper.Lerp(1.00f, 0.01f, healthRatio);
+            modifiers.FinalDamage *= damageMultiplier;
+        }
+
+        // Flawless Exorcism Bypass & Kill Text Flag Tracker
+        private bool CheckExorcismOneTap(Projectile projectile, ref NPC.HitModifiers modifiers)
+        {
+            if (ModLoader.TryGetMod("CalamityMod", out Mod calamity))
+            {
+                if (projectile.ModProjectile != null && projectile.ModProjectile.Mod.Name == "CalamityMod")
+                {
+                    string pName = projectile.ModProjectile.Name;
+                    if (pName == "ExorcismProj" || pName == "ExorcismBlast" || pName == "ExorcismHolyRay")
+                    {
+                        if (calamity.TryFind<ModPrefix>("Flawless", out ModPrefix flawlessPrefix))
+                        {
+                            Player player = Main.player[projectile.owner];
+                            if (player.HeldItem?.ModItem?.Mod.Name == "CalamityMod" && 
+                                player.HeldItem.ModItem.Name == "Exorcism" && 
+                                player.HeldItem.prefix == flawlessPrefix.Type)
+                            {
+                                modifiers.SetInstantKill();
+                                killedByExorcism = true; 
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Ark of the Cosmos Drop Rules Injected safely into Calamity catalogs
+        public override void ModifyNPCLoot(NPCLoot npcLoot)
+        {
+            if (ModLoader.TryGetMod("CalamityMod", out Mod calamity))
+            {
+                if (calamity.TryFind<ModItem>("ArkOfTheCosmos", out ModItem arkItem))
+                {
+                    npcLoot.Add(ItemDropRule.Common(arkItem.Type, 1, 1, 1));
+                }
+            }
+        }
+
+        public override void OnKill()
+        {
+            AsmogtheusWorldSystem.DownedAsmogtheus = true;
+
+            if (Main.netMode != NetmodeID.MultiplayerClient)
+            {
+                if (killedByExorcism)
+                {
+                    Main.NewText("The power of the Heavens has purged The Ruinous Devourer", Color.Gold);
+                }
+                else
+                {
+                    Main.NewText($"Asmogtheus' influence on {Main.worldName} has faded", Color.PaleGreen);
+                }
+
+                // Generates Auric Ore veins across bedrock layers on downing
+                if (ModLoader.TryGetMod("CalamityMod", out Mod calamity) && calamity.TryFind<ModTile>("AuricOreInWorld", out ModTile auricTile))
+                {
+                    for (int k = 0; k < (int)(Main.maxTilesX * Main.maxTilesY * 0.002); k++)
+                    {
+                        int x = Main.rand.Next(100, Main.maxTilesX - 100);
+                        int y = Main.rand.Next((int)Main.rockLayer, Main.maxTilesY - 200);
+                        WorldUtils.Gen(new Point(x, y), new Shapes.Circle(Main.rand.Next(4, 9)), SetModTile.Create(auricTile.Type));
+                    }
+                }
+            }
+        }
+    }
+
+    // Body segment handling splitting (Transforms behind segments into independent heads)
+    public class DivineWormBody : ModNPC
+    {
+        public override void SetDefaults()
+        {
+            NPC.width = 90;
+            NPC.height = 90;
+            NPC.damage = 210;
+            NPC.defense = 400; 
+            NPC.lifeMax = 2000000000;
+            NPC.noGravity = true;
+            NPC.noTileCollide = true;
+            NPC.behindTiles = true;
+        }
+
+        public override void OnKill()
+        {
+            if (Main.netMode != NetmodeID.MultiplayerClient)
+            {
+                int behindNPC = (int)NPC.ai;
+                if (behindNPC >= 0 && behindNPC < Main.maxNPCs && Main.npc[behindNPC].active)
+                {
+                    Main.npc[behindNPC].Transform(ModContent.NPCType<AsmogtheusHead>());
+                    Main.npc[behindNPC].netUpdate = true;
+                }
+            }
+        }
+    }
+
+    // 50% HP threshold sidekick targets
+    public class DivineWormNuisance : ModNPC
+    {
+        public override void SetDefaults()
+        {
+            NPC.width = 80;
+            NPC.height = 80;
+            NPC.damage = 180;
+            NPC.lifeMax = 500000000;
+            NPC.noGravity = true;
+            NPC.noTileCollide = true;
+            NPC.behindTiles = true;
+        }
+    }
+}
